@@ -21,8 +21,9 @@
 #define OLED_H     64
 #define OLED_ADDR  0x3C
 
-// Status LED
-#define LED_PIN    27
+// Status LEDs
+#define LED_PIN     27   // Heartbeat / encendido
+#define ANT_LED_PIN 25   // Testigo antenas: OFF = DISARMED, ON = ARMED
 
 // SPI clock for NRF24
 #define NRF_SPI_HZ 16000000

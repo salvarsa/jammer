@@ -27,6 +27,12 @@ static bool ledState = false;
 static bool radioH_ok = false;
 static bool radioV_ok = false;
 
+// --- Variables para el control del switch ARM/DISARM ---
+static bool antArmed = false;       // Estado actual (true = emitiendo)
+static uint32_t lastDebounceMs = 0;
+
+#define ARM_SWITCH 26
+
 static void killEspRadios() {
   esp_bt_controller_disable();
   esp_wifi_stop();
@@ -44,8 +50,7 @@ static bool initRadio(RF24& r, SPIClass& bus, const char* tag) {
   r.setPALevel(RF24_PA_MAX, true);
   r.setDataRate(RF24_2MBPS);
   r.setCRCLength(RF24_CRC_DISABLED);
-  r.startConstCarrier(RF24_PA_MAX, 45);
-  Serial.printf("[%s] up\n", tag);
+  Serial.printf("[%s] initialized (waiting for ARM)\n", tag);
   return true;
 }
 
@@ -54,23 +59,33 @@ static void drawUi() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
 
-  oled.drawStr(0, 8, "ESP32 2.4GHz JAMMER");
+  // Línea superior: Estado ARM/DISARM
+  if (antArmed) {
+    oled.drawStr(0, 8, ">> ARMED <<");
+  } else {
+    oled.drawStr(0, 8, ">> DISARMED <<");
+  }
   oled.drawHLine(0, 11, 128);
 
-  if (radioH_ok) snprintf(buf, sizeof(buf), "HSPI ch: %u", chH);
-  else           snprintf(buf, sizeof(buf), "HSPI ch: FAIL");
+  // Estado de las radios
+  if (radioH_ok && antArmed) snprintf(buf, sizeof(buf), "HSPI ch: %u", chH);
+  else if (radioH_ok)        snprintf(buf, sizeof(buf), "HSPI: READY");
+  else                       snprintf(buf, sizeof(buf), "HSPI: FAIL");
   oled.drawStr(0, 22, buf);
 
-  if (radioV_ok) snprintf(buf, sizeof(buf), "VSPI ch: %u", chV);
-  else           snprintf(buf, sizeof(buf), "VSPI ch: FAIL");
+  if (radioV_ok && antArmed) snprintf(buf, sizeof(buf), "VSPI ch: %u", chV);
+  else if (radioV_ok)        snprintf(buf, sizeof(buf), "VSPI: READY");
+  else                       snprintf(buf, sizeof(buf), "VSPI: FAIL");
   oled.drawStr(0, 32, buf);
 
+  // Modo y saltos
   snprintf(buf, sizeof(buf), "Mode: rand 0-%u", CH_MAX - 1);
   oled.drawStr(0, 42, buf);
 
   snprintf(buf, sizeof(buf), "Hops: %lu", (unsigned long)hopCount);
   oled.drawStr(0, 52, buf);
 
+  // Tiempo encendido
   uint32_t s = millis() / 1000;
   snprintf(buf, sizeof(buf), "Up: %lum %02lus",
            (unsigned long)(s / 60), (unsigned long)(s % 60));
@@ -86,6 +101,13 @@ void setup() {
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  pinMode(ANT_LED_PIN, OUTPUT);
+  digitalWrite(ANT_LED_PIN, LOW);
+
+  // --- Configurar el pin del switch ---
+  // Usamos PULLDOWN interna: si el switch está abierto o a GND -> LOW (DISARM)
+  // Si lo conectamos a 3.3V -> HIGH (ARM)
+  pinMode(ARM_SWITCH, INPUT_PULLDOWN);
 
   Wire.begin(OLED_SDA, OLED_SCL);
   Wire.setClock(400000);
@@ -108,26 +130,95 @@ void setup() {
   lastBlinkMs = millis();
 }
 
+// void loop() {
+//   if (radioH_ok) {
+//     chH = random(CH_MAX);
+//     radioH.setChannel(chH);
+//   }
+//   if (radioV_ok) {
+//     chV = random(CH_MAX);
+//     radioV.setChannel(chV);
+//   }
+//   hopCount++;
+//   delayMicroseconds(random(60));
+
+//   uint32_t now = millis();
+
+//   if (now - lastBlinkMs >= 125) {
+//     lastBlinkMs = now;
+//     ledState = !ledState;
+//     digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+//   }
+
+//   if (now - lastUiMs >= 200) {
+//     lastUiMs = now;
+//     drawUi();
+//   }
+// }
+
 void loop() {
-  if (radioH_ok) {
-    chH = random(CH_MAX);
-    radioH.setChannel(chH);
-  }
-  if (radioV_ok) {
-    chV = random(CH_MAX);
-    radioV.setChannel(chV);
-  }
-  hopCount++;
-  delayMicroseconds(random(60));
+  // --- 1. LECTURA DEL SWITCH CON ANTIRREBOTE (Debounce) ---
+  bool rawState = digitalRead(ARM_SWITCH); // HIGH = ARMED, LOW = DISARMED
+  
+  if (rawState != antArmed) {
+    // Si ha cambiado, esperamos 50ms para confirmar (antirrebote)
+    if (millis() - lastDebounceMs > 50) {
+      lastDebounceMs = millis();
+      antArmed = rawState; // Actualizamos el estado oficial
 
+      if (antArmed) {
+        // --- ACCIÓN AL ARMAR ---
+        Serial.println(">> ARMING radios...");
+        if (radioH_ok) {
+          chH = random(CH_MAX);
+          radioH.startConstCarrier(RF24_PA_MAX, chH);
+        }
+        if (radioV_ok) {
+          chV = random(CH_MAX);
+          radioV.startConstCarrier(RF24_PA_MAX, chV);
+        }
+        hopCount = 0;
+      } else {
+        // --- ACCIÓN AL DESARMAR ---
+        Serial.println(">> DISARMING radios...");
+        if (radioH_ok) radioH.stopConstCarrier();
+        if (radioV_ok) radioV.stopConstCarrier();
+      }
+    }
+  } else {
+    lastDebounceMs = millis();
+  }
+
+  // --- 2. LOGICA DE HOPPING (SOLO SI ESTA ARMADO) ---
+  if (antArmed) {
+    if (radioH_ok) {
+      chH = random(CH_MAX);
+      radioH.stopConstCarrier();
+      radioH.startConstCarrier(RF24_PA_MAX, chH);
+    }
+    if (radioV_ok) {
+      chV = random(CH_MAX);
+      radioV.stopConstCarrier();
+      radioV.startConstCarrier(RF24_PA_MAX, chV);
+    }
+    hopCount++;
+    delayMicroseconds(random(60));
+  } else {
+    delay(1);
+  }
+
+  // --- 3. HEARTBEAT DEL LED (parpadeo a ~4Hz) ---
   uint32_t now = millis();
-
   if (now - lastBlinkMs >= 125) {
     lastBlinkMs = now;
     ledState = !ledState;
     digitalWrite(LED_PIN, ledState ? HIGH : LOW);
   }
 
+  // --- 3b. LED TESTIGO ANTENAS: ON = ARMED, OFF = DISARMED ---
+  digitalWrite(ANT_LED_PIN, antArmed ? HIGH : LOW);
+
+  // --- 4. ACTUALIZACION DE LA OLED (cada 200ms) ---
   if (now - lastUiMs >= 200) {
     lastUiMs = now;
     drawUi();
